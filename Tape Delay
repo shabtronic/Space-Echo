@@ -1,0 +1,827 @@
+//desc:Tape Delay
+
+slider1:rrate=220<35,1000>-Repeat Rate (ms)
+slider2:feedback=0.707<0,1,0.001>-Intensity
+
+slider3:pan1=-0.33<-1,1>-Pan1
+slider4:pan2=0.33<-1,1>-Pan2
+slider5:pan3=-1<-1,1>-Pan3
+slider6:pan4=1<-1,1>-Pan4
+
+slider8:headconfig=0<0,14,1>- Head Config
+
+slider9:warp=12<0,24>-Time-Warp
+
+slider10:WAF=0.5<0,1,0.0001>-Wow & Flutter
+
+slider12:sat=0<0,1>-Saturation
+slider14:duck=0<0,2>-Ducking
+
+slider20:wet=1<0,1>-Echo Level
+slider21:dry=1<0,1>-Dry
+
+slider30:bass=3<-12,12>-Bass
+slider31:high=3<-12,12>-Treble
+
+slider32:tapeage=0.2<0.001,2>-Tape Age
+slider33:crushLevel=8<1,24,1>-Input Crush
+options:no_meter;
+in_pin:left input
+in_pin:right input
+out_pin:left output
+out_pin:right output
+
+//
+// Simple Tape Style Echo
+//
+// (C) 2024 S.D.Smith all rights reserved
+//
+// Features:
+//    Smooth rate changing
+//    sounds ok-ish!
+//    Co-routine processing for embedded devices
+//
+// Development time: roughly 10 working days
+
+@slider //*******************************************************************************************************
+
+
+@init //*******************************************************************************************************
+
+mp=0;
+
+
+
+
+function alloc(size)
+(
+mp+=size;
+mp-size;
+);
+
+function fmod(x,s)            ( x-(floor(x/s)*s); ); 
+function ToCurve(x)             ( 1+0.15*log(x); );
+function InvToCurve(x)          ( exp((x-1)/0.15); ); 
+
+// RBJ Filters from Audio-EQ-Cookbook.txt, by Robert Bristow-Johnson
+// Bi Quad data uses a array where:
+// 0-4 = coeffs
+// 5-6 = Left in/out
+// and then if you like
+// 7-8 = Right in out
+// 8-9 = whatever u like 
+// so if you wanted to so quad channel processing you'd do something like this:
+
+// chan1=ProcessBiquad(BiQuadData,0,chan1);
+// chan2=ProcessBiquad(BiQuadData,2,chan2);
+// chan3=ProcessBiquad(BiQuadData,4,chan3);
+// chan4=ProcessBiquad(BiQuadData,6,chan4);
+function BiQuadAllPass(Data,freq)
+(
+0;
+);
+function BiQuadLoShelf(Data,Freq,Gain)
+(
+K = tan($pi * freq / (srate)); 
+V = pow(10.0, abs(Gain) / 20.0);
+(Gain >= 0) ?
+  (    // boost
+  norm = 1 / (1 + sqrt(2) * K + K * K);
+  Data[2] = (1 + sqrt(2 * V) * K + V * K * K) * norm;
+  Data[3] = 2 * (V * K * K - 1) * norm;
+  Data[4] = (1 - sqrt(2 * V) * K + V * K * K) * norm;
+  Data[0] = 2 * (K * K - 1) * norm;
+  Data[1] = (1 - sqrt(2) * K + K * K) * norm;
+  )
+:
+  (// cut
+  norm = 1 / (1 + sqrt(2 * V) * K + V * K * K);
+  Data[2] = (1 + sqrt(2) * K + K * K) * norm;
+  Data[3] = 2 * (K * K - 1) * norm;
+  Data[4] = (1 - sqrt(2) * K + K * K) * norm;
+  Data[0] = 2 * (V * K * K - 1) * norm;
+  Data[1] = (1 - sqrt(2 * V) * K + V * K * K) * norm;
+  );
+ );
+ 
+function BiQuadHiShelf(Data,Freq,Gain)
+(
+ K = tan($pi * freq / (srate)); 
+ V = pow(10.0, abs(Gain) / 20.0);
+(Gain >= 0)? 
+  (
+  norm = 1 / (1 + sqrt(2) * K + K * K);
+  Data[2] = (V + sqrt(2 * V) * K + K * K) * norm;
+  Data[3] = 2 * (K * K - V) * norm;
+  Data[4] = (V - sqrt(2 * V) * K + K * K) * norm;
+  Data[0] = 2 * (K * K - 1) * norm;
+  Data[1] = (1 - sqrt(2) * K + K * K) * norm;
+  )
+:
+  (// cut
+  norm = 1 / (V + sqrt(2 * V) * K + K * K);
+  Data[2] = (1 + sqrt(2) * K + K * K) * norm;
+  Data[3] = 2 * (K * K - 1) * norm;
+  Data[4] = (1 - sqrt(2) * K + K * K) * norm;
+  Data[0] = 2 * (K * K - V) * norm;
+  Data[1] = (V - sqrt(2 * V) * K + K * K) * norm;
+  ); 
+);
+
+// Returns the raw Amplitude of a input signal at value level 1 at freq in the filter
+// It's actually really simple how this works:
+// It generates a 3 sample signal (cos2WO,cosW0 and 1) based on the freq
+// runs them thru the filter coeffs as if it's a infintley long signal
+// and returns the output. The infinite part, is it calculate the prev and prevprev
+// values as if the filter had been run infinitely.
+//
+// So it's a math optimized version of a call to BiQuadProcess 
+// using the freq signal generated and the prev/prevprev 
+// values as if it had been run infinitely. 
+
+function BiQuadResponse(Data,freq)
+(
+w0 = 2 * $pi * freq/srate; // calc time period for 1 sample at freq
+cosW0 = cos(w0);
+cos2W0 = cos(2.0 * w0);
+num = (Data[2]*Data[2]) + (Data[3]*Data[3]) + (Data[4]*Data[4]) + (2.0 * cosW0 * ((Data[2] * Data[3]) + (Data[3] * Data[4]))) + (2.0 * cos2W0 * Data[2] * Data[4]);
+den = 1.0 + (Data[0]*Data[0]) + (Data[1]*Data[1]) + (2.0 * cosW0 * (Data[0] + (Data[0] * Data[1]))) + (2.0 * cos2W0 * Data[1]);
+abs(num / den);
+);
+
+
+// Larger Q = thinner band
+function BiQuadBand(Data,freq,q)
+(
+K = tan($pi * freq / (srate));
+norm = 1.0 / (1.0 + K / q + K * K);
+Data[2] = K / q * norm;
+Data[3] = 0.0;
+Data[4] = -Data[2];
+Data[0] = 2.0 * (K * K - 1.0) * norm;
+Data[1] = (1.0 - K / q + K * K) * norm;
+);
+// Offset points to in/out data - which is 2 elements
+// so this must be 0,2,4,6,8,10 e.t.c.
+// Handy to process stereo/quad or separate channels with the same coeffs
+function BiQuadProcess(FilterData,offset,in) local (out)
+(
+out = in * FilterData[2] + FilterData[5+offset];
+FilterData[5+offset] = (in * FilterData[3]) + FilterData[6+offset] - (FilterData[0] * out);
+FilterData[6+offset] = (in * FilterData[4]) - (FilterData[1] * out);
+out;
+);
+
+function BiQuadResponse2(Data,freq) local (w,s1,s2,s3)
+(
+w = 2*$pi*freq/srate; // Time/Phase incrementor for Freq
+// Generate a Signal with Freq
+s1 = cos(0);     // 1
+s2 = cos(w);     // 1+T
+s3 = cos(2*w);   // 1+2T
+
+// Calc prev and prevprev for this signal - HEADACHE!!
+Data[15]=0;
+Data[16]=0;
+i=0;
+sp=-w*300;
+while (i<300)
+  (
+  res=BiQuadProcess(Data,10,cos(sp));
+  sp+=w;
+  i+=1;
+  );
+res;
+);
+
+function frac(x)                ( x-floor(x); );
+function DBtoLinear(x)          ( pow(10,x/10););
+function LinearToDB(x,dmin)     ( (-20*log10(x/10)/-dmin); );
+function tanh(x)                ( (exp(x)-exp(-x))/(exp(x)+exp(-x)););
+function clamp(x,minv,maxv) ( x<minv? x=minv; x>maxv? x=maxv; x);
+function InterpCosine(v1,v2,t)  ( v1+(v2-v1)*((1-cos(t*$pi))*0.5); );
+
+function InterpLinear(buf,size,pos) local (f,i,size,pos)  (i=floor(pos);f=pos-i;(1-f)*buf[i%size]+f*buf[(i+1)%size];);
+
+
+function tanhm(x,m) local (fx,ox,xx) // "m" in range [0; 1)
+(
+ox=x;
+ox>1? ox=1;
+ox<-1? ox=-1;
+xx=tanh(x);
+fx=(xx-ox)*m+ox;
+fx;
+);
+
+function SetCombo(idx,v1,v2,v3,v4)
+(
+Combos[idx*4+0]=v1;
+Combos[idx*4+1]=v2;
+Combos[idx*4+2]=v3;
+Combos[idx*4+3]=v4;
+);
+
+function GetComboSum(idx)
+(
+Sum=Combos[idx*4+0];
+Sum+=Combos[idx*4+1];
+Sum+=Combos[idx*4+2];
+Sum+=Combos[idx*4+3];
+Sum;
+);
+
+function SwapBuffers()
+(
+T=MainBuf;
+MainBuf=CopyBuf;
+CopyBuf=T;
+);
+
+// SDS - This makes the rate changes smooth and fun
+// This will trigger a "Co-Routine" style process
+// so we process X resample samples every single input sample.
+// worst case is we resample a buffer to the full delay time size
+// say we have to resample a buffer to 44100 samples (or depending on the MaxTime constant)
+// since we allow resampling 25 times a second
+// that gives us 44100/25 samples time to resample a whole buffer
+// 1764 samples time to resample to 44100 size.
+// That means we should process 25 resample samples per single input sample.
+// so we use the Resample update time as the co-routine process amount.
+//
+// This is really messy and complex - but allows the code to run on shabby performing
+// single threaded hardware (embedded e.t.c).
+// which I plan to do (Daisy or Teensy)
+
+function ResampleBuffer(NewSize)
+(
+  (ActualBufSize!=NewSize) && RSRemaining==0?
+  (
+  // Trigger a co-routine resample
+  RSScale=ActualBufSize/NewSize;
+  RSRemaining=NewSize;
+  
+  // Calc where IReadP will be at the end of the co-routine
+  // so we don't trash anything it's written before the end of
+  // the resample co-routine. Which means the last chunk of resample
+  // processing must end exactly where IRead Pointer is at that point
+  // in time.
+  //    We must do this else we'll get horrible crackles in the echo
+  // buffer. Messy stuff! We don't need to worry about W&T since that's
+  // only used on a read, and that won't propagate crackles into the
+  // echo buffer.
+  
+  RSPointer=floor((IReadP+1+floor(NewSize/ReSampleChunkSize))/RSScale)%NewSize;
+  RSNewSize=NewSize;
+  );
+);
+
+// Co-Routine to do the actual resample
+function CoProcessResampling()
+(
+RSRemaining>0?
+  (
+    i=0;
+    while (i<ReSampleChunkSize && RSRemaining>0)
+      (
+      // Should really use cosine, hermite or catmul interpolation for this
+      // but I'm too lazy - and you know these little imperfections all
+      // make up the "magic sauce".
+      CopyBuf[RSPointer]=floor(InterpLinear(MainBuf,ActualBufSize,RSPointer*RSScale)*127)/127;
+      RSPointer+=1;
+      RSPointer>=RSNewSize? RSPointer=0;
+      RSRemaining-=1;
+      i+=1;
+      );
+    RSRemaining==0?
+      (
+      SwapBuffers();
+      IReadP=floor(IReadP/RSScale);
+      ActualBufSize=RSNewSize;
+      );
+  );
+);
+
+
+MaxTime=1; // 1 Second buffer time
+BufSize=srate*MaxTime;
+ActualBufSize=BufSize;
+MainBuf=Alloc(BufSize);   // Main Echo buff
+CopyBuf=Alloc(BufSize);   // Copy of Echo buff used in resampling
+Combos=Alloc(24*4);       // Tape head volumes for each combination
+// Filter Params
+BandPass=Alloc(32); // 32 give us 32-5 = 28/2 =14 channels of processing space
+LoShelf=Alloc(32); 
+HiShelf=Alloc(32);
+// Used for GFX
+util=alloc(32); 
+
+
+BiQuadBand(BandPass,750,0.1);
+BiQuadLoShelf(LoShelf,200,1);
+BiQuadHiShelf(HiShelf,2000,1);
+
+// Only resample every 24fps if needed
+// smooth enough for fun e.t.c.
+ResampleFreqCount=srate/24; 
+RC=ResampleFreqCount;
+ReSampleChunkSize=50;
+// Tape head Times SmoothDamp values
+// so we don't snap and cause a big mess on startup
+adt1=pow(0,warp/12);
+adt2=pow(0.25,warp/12);
+adt3=pow(0.5,warp/12);
+adt4=pow(0.75,warp/12);
+
+WTSize=64;
+i=0;
+while (i<WTSize)
+  (
+  WowBuf[i]=rand(2)-1;
+  FlutterBuf[i]=rand(2)-1;
+  i+=1;
+  );
+CFS=0;
+
+// Setup the head combo values - amp values used to turn the heads off and on
+// when mixing
+SetCombo(0,1,0,0,0);
+SetCombo(1,0,1,0,0);
+SetCombo(2,0,0,1,0);
+SetCombo(3,0,0,0,1);
+SetCombo(4,1,1,0,0);
+SetCombo(5,1,0,1,0);
+SetCombo(6,1,0,0,1);
+SetCombo(7,0,1,1,0);
+SetCombo(8,1,0,1,1);
+SetCombo(9,0,1,0,1);
+SetCombo(10,0,0,1,1);
+SetCombo(11,1,1,1,0);
+SetCombo(12,1,1,0,1);
+SetCombo(13,0,1,1,1);
+SetCombo(14,1,1,1,1);
+// Init UI stuff
+DraggingID=ControlID=SelectedControl=-1;
+
+function ParamsChanged()
+(
+sat4=pow(saturation,14);
+Pan1L=(cos((Pan1+1)/2*$pi/2));
+Pan1R=(sin((Pan1+1)/2*$pi/2));
+Pan2L=(cos((Pan2+1)/2*$pi/2));
+Pan2R=(sin((Pan2+1)/2*$pi/2));
+Pan3L=(cos((Pan3+1)/2*$pi/2));
+Pan3R=(sin((Pan3+1)/2*$pi/2));
+Pan4L=(cos((Pan4+1)/2*$pi/2));
+Pan4R=(sin((Pan4+1)/2*$pi/2));
+ComboSum=GetComboSum(headconfig);
+dt1=pow(0,warp/12);
+dt2=pow(0.25,warp/12);
+dt3=pow(0.5,warp/12);
+dt4=pow(0.75,warp/12);
+
+// Recalc the filters
+BiQuadLoShelf(LoShelf,300,Bass);
+BiQuadHiShelf(HiShelf,2000,High);
+BiQuadBand(BandPass,750,TapeAge);
+// Delay size
+TargetBufSize=floor(rrate/1000*srate);
+IBufSize=floor(TargetBufSize);
+);
+@slider //*******************************************************************************************************
+
+ParamsChanged();
+@block //*******************************************************************************************************
+
+
+
+@sample //*******************************************************************************************************
+
+function ReadHead(pos)
+(
+MainBuf[pos%ActualBufSize];
+);
+  // Saturate the input
+  inl=tanh((spl0*(1+sat))*(1+sat4));
+  inr=tanh((spl1*(1+sat))*(1+sat4));
+  in=(inl+inr)/2;
+  // Bit crush the input - Low level 1-7 can give a really great sounding hiss/hi component
+  // to the sound.
+  BitLevel=(1<<crushLevel)/2;
+  in=floor(in*BitLevel)/BitLevel;
+  // Update peak meter
+  Peak*=0.9999;
+  abs(in)>Peak? Peak=abs(in);
+
+  // Wow and Flutter
+  lfo=sin(lfot*2*$pi);
+  lfot+=3/srate;
+  WAFA=(1+lfo*WAF)*0.01*ActualBufSize;
+
+  // SmoothDamp HeadCombo Volumes
+  HTDamp=50/SRATE;
+  HT1+=(Combos[headconfig*4+0]-HT1)*HTDamp;
+  HT2+=(Combos[headconfig*4+1]-HT2)*HTDamp;
+  HT3+=(Combos[headconfig*4+2]-HT3)*HTDamp;
+  HT4+=(Combos[headconfig*4+3]-HT4)*HTDamp;
+  
+  // SmoothDamp the Time-Warp
+  TWDamp=0.0001;
+  adt1+=(dt1-adt1)*TWDamp;
+  adt2+=(dt2-adt2)*TWDamp;
+  adt3+=(dt3-adt3)*TWDamp;
+  adt4+=(dt4-adt4)*TWDamp; 
+  
+  // Read the echo buffers
+  InHead=ReadHead(WAF+IReadP);
+  Head1=InHead*HT1;
+  Head2=ReadHead(WAFA+IReadP+adt2*ActualBufSize)*HT2; 
+  Head3=ReadHead(WAFA+IReadP+adt3*ActualBufSize)*HT3; 
+  Head4=ReadHead(WAFA+IReadP+adt4*ActualBufSize)*HT4; 
+  
+  // Only using the longest head to feedback into the echo buffer
+  // Tried using all the heads ends up a FDN style mess
+  InHead=InHead*pow(Feedback,1/3);
+  // Write to the echo buffer
+  TapeWrite=clamp((1+TapeAge/200)*BiQuadProcess(BandPass,0,in+InHead),-1,1);
+  // Simulate a 8 bit buffer
+  // Bi-Quad tape age puts a "Halo" around the sound with this bitcrush
+  // Should really link this bit crush to buffer size
+  // but it's meh-o-clock - crack open the beers!
+  MainBuf[IReadP]=floor(TapeWrite*127)/127;
+
+  // Output the heads
+  outl=Pan1R*Head1;
+  outr=Pan1L*Head1;
+  outl+=Pan2R*Head2;
+  outr+=Pan2L*Head2;
+  outl+=Pan3R*Head3;
+  outr+=Pan3L*Head3;
+  outl+=Pan4R*Head4;
+  outr+=Pan4L*Head4;
+
+
+  // Process the filters
+  outl=BiQuadProcess(LoShelf,0,outl);
+  outr=BiQuadProcess(LoShelf,2,outr);
+  outl=BiQuadProcess(HiShelf,0,outl);
+  outr=BiQuadProcess(HiShelf,2,outr);
+  
+  // Duck the output
+  outl=outl*(1-clamp(Peak*duck,0,1));
+  outr=outr*(1-clamp(Peak*duck,0,1));
+  
+  // Finally output the sample
+  spl0 = inl*dry+outl*wet;
+  spl1 = inr*dry+outr*wet;
+
+  // Resample the echo buffer 
+  RC-=1;
+  RC<0?
+    (
+    ResampleBuffer(IBufSize);
+    RC=ResampleFreqCount;
+    );
+  // Co-Process the Resampling
+  CoProcessResampling();
+  // Update read/write position
+  IReadP+=1;
+  IReadP>=ActualBufSize ?  IReadP=0;
+ 
+@gfx //*******************************************************************************************************
+
+function min(v1,v2)           ( v2<v1 ? v1=v2; v1; );
+function max(v1,v2)           ( v2>v1 ? v1=v2; v1; );
+function length(x,y)          ( sqrt(x*x+y*y););
+function gfx_xy(x,y)          ( gfx_x=x; gfx_y=y;);
+function gfx_greyscale(g,a)   ( gfx_set(g,g,g,a););
+
+function Area(x,y,w,h)
+(
+x<=1? area_x=gfx_w*x : area_x=x;
+y<=1? area_y=gfx_h*y : area_y=y;
+w<=1? area_w=gfx_w*w : area_w=w;
+h<=1? area_h=gfx_h*h : area_h=h;
+);
+
+function AreaRect(x,y,w,h,f)    ( gfX_rect(x+area_x,y+area_y,w,h,f););
+function AreaLine(x1,y1,x2,y2)  ( gfx_line(x1+area_x,y1+area_y,x2+area_x,y2+area_y););
+
+// StartAng 0=6oclock 1=6oClock clockwise from 0
+// Not exact - can't be used to Accel fills e.t.c :(
+function dfArc(px,py,StartAng,EndAng,OuterRad,Thickness)
+(
+CAng=((atan2(-px,-py))+$pi)/(2*$pi);
+StartAng=1-(StartAng-floor(StartAng));
+EndAng=1-(EndAng-floor(EndAng));
+AAAmount=OuterRad*4; // OuterRad*4= aa amount - seems to work
+Lim1=(CAng-StartAng)*AAAmount;
+Lim2=-(CAng-EndAng)*AAAmount;
+max(max(max(length(px,py)-OuterRad,-(length(px,py)-(OuterRad-Thickness)) ),Lim1),Lim2);
+);
+// IQ RGBA box sdf from: https://iquilezles.org/articles/distfunctions2d/
+function dfBox(px,py,bx,by)
+(
+dx = abs(px)-bx/2;
+dy = abs(py)-by/2;
+length(max(dx,0.0),max(dy,0)) + min(max(dx,dy),0.0);
+);
+
+function RoundRect2(x,y,w,h,rad) local (x,y,w,h,sx,sy,d,oa,rad)
+(
+oa=gfx_a;
+rad=min(w/2,min(h/2,rad));
+sy=-h/2;
+while (sy<h/2)
+  (
+  gfx_y=y+sy+h/2;
+  sx=-w/2;
+  while (sx<w/2)
+    (
+    d=-(dfBox(sx,sy,w-rad*2,h-rad*2)-rad);
+    gfx_x=x+sx+w/2;
+    //SDS - AA - 0-1
+    gfx_a=oa*clamp(d,0,1);
+    d>0 && d<2 ? gfx_setpixel(gfx_r,gfx_g,gfx_b);
+    abs(d)>=2? 
+      (
+      (d)>=2? gfx_line(gfx_x,gfx_y,gfx_x+floor(abs(d)-2),gfx_y,0);// set to d-3 to see the fill spans
+      sx+=floor(abs(d)-2);
+      );
+    sx+=1;
+    );
+  sy+=1;
+  );
+Debug?
+  (
+  maxx=x+1000-(dfBox(1000-w/2,0,w-rad*2,h-rad*2)-rad);
+  minx=x+1000-(dfBox(-1000-w/2,0,w-rad*2,h-rad*2)-rad);
+  maxy=y+1000-(dfBox(0,1000-h/2,w-rad*2,h-rad*2)-rad);
+  miny=y+1000-(dfBox(0,-1000-h/2,w-rad*2,h-rad*2)-rad);
+  gfx_set(1,0,0,1);
+  gfx_line(maxx,0,maxx,gfx_h);
+  gfx_line(0,maxy,gfx_w,maxy);
+  
+  gfx_set(0,1,0,1);
+  gfx_line(minx,0,minx,gfx_h);
+  gfx_line(0,miny,gfx_w,miny);
+  );
+  gfx_a=oa;
+  gfx_xy(x,y);
+);
+
+function ArcFill(w,h,sa,ea,rad,thickness) local (ox,oy,sx,sy,d,oa)
+(
+ox=gfx_x;
+oy=gfx_y;
+x=gfx_x;
+y=gfx_y;
+oa=gfx_a;
+sy=0;
+while (sy<h)
+  (
+  sx=0;
+  gfx_y=sy+y;
+  while (sx<w)
+    (
+    d=(-dfArc(sx-w/2,sy-h/2,sa,ea,rad,thickness));
+    gfx_a=oa*clamp(abs(d),0,1);
+    gfx_x=sx+x;
+    //d=abs(d);
+    //gfx_set(d,d,d,1);
+    //gfx_setpixel(gfx_r,gfx_g,gfx_b);
+    d>=0? gfx_setpixel(gfx_r,gfx_g,gfx_b);
+    sx+=1;
+    );
+  sy+=1;
+  );
+// Debug
+Debug?
+  (
+  maxx=x+(dfArc(0,0,sa,ea,rad,thickness));
+  minx=x+1000-(dfArc(-1000-w/2,0,sa,ea,rad,thickness));
+  maxy=y+1000-(dfArc(0,1000-h/2,sa,ea,rad,thickness));
+  miny=y+1000-(dfArc(0,-1000-h/2,sa,ea,rad,thickness));
+  gfx_set(1,0,0,1);
+  gfx_line(maxx,0,maxx,gfx_h);
+  gfx_line(0,maxy,gfx_w,maxy);
+  gfx_set(0,1,0,1);
+  gfx_line(minx,0,minx,gfx_h);
+  gfx_line(0,miny,gfx_w,miny);
+  );
+
+gfx_a=oa;
+gfx_x=ox;
+gfx_y=oy;
+);
+function MouseUnClicked(mb)   ( (PrevMouseCap&mb) && !(Mouse_cap&mb); );
+function MouseClicked(mb)   ( !(PrevMouseCap&mb) && (Mouse_cap&mb); );
+function MouseDown(mb)      ( mouse_cap&mb; );
+function MouseRect(x,y,w,h) ( mouse_x>=x && mouse_x<=(x+w) && mouse_y>=y && mouse_y<=(y+h););
+
+function StartUI()          ( ParamsDidChange=0;SelectedControl=-1; ControlID=-1; );
+function EndUI()            ( !MouseDown(3)? SelectedControl=-1;PrevMouseCap=mouse_cap; );
+
+
+function HintStr(str)       ( hstr=str; );
+
+function Dial(x,y,w,h,str,value,minv,maxv,default, fillstart,integer)
+(
+ogvalue=value;
+x+=area_x;
+y+=area_y;
+ControlID+=1;
+//Do the mouse stuff
+MouseRect(x,y,w,h) && MouseDown(3)? SelectedControl=ControlID;
+MouseRect(x,y,w,h) && MouseDown(2)? Value=Default;
+MouseRect(x,y,w,h) && MouseClicked(1)?
+  (
+  DraggingID=ControlID;
+  DraggingX=mouse_x;
+  DraggingY=mouse_y;
+  DraggingValue=value;
+  );
+MouseRect(x,y,w,h) && mouse_wheel?
+  (
+  SelectedControl=ControlID;
+  mouse_wheel>0? ( value+=(maxv-minv)*0.001;mouse_wheel=0;);
+  mouse_wheel<0? ( value-=(maxv-minv)*0.001;mouse_wheel=0;);
+  );
+// Dragging
+mouseDown(1) && DraggingID==ControlID?
+  (
+  value=DraggingValue+(DraggingY-mouse_y)*(maxv-minv)/100;
+  );
+  
+MouseUnClicked(1)? DraggingID=-1;
+  
+  integer? value=floor(value);
+value=clamp(value,minv,maxv);
+// Constants
+
+// Value to parametric
+vp=(value-minv)/(maxv-minv);
+dp=(default-minv)/(maxv-minv);
+cp=(fillstart-minv)/(maxv-minv);
+// Parameteric to Arc
+va=(vp*(0.9-0.1))+0.1;
+da=(dp*(0.9-0.1))+0.1;
+ca=(cp*(0.9-0.1))+0.1;
+// Fill min/max
+sfa=min(va,ca);
+efa=max(va,ca);
+// Calc Rad from W and H and text height
+LR=min(W,H)-10;
+// Render
+  //gfx_set(0.2,0.7,0.2,0.7);
+  //RoundRect2(x,y,w,h,30);
+rad=LR/2;
+offx=(w-rad*2)/2;
+offy=(h-LR)/2;
+gfx_xy(offx+x,y+offy);
+gfx_greyscale(0.2,1);
+gfx_circle(gfx_x+rad,gfx_y+rad,rad,1,1);
+radoff=7;
+rad-=radoff;
+gfx_xy(gfx_x+radoff,gfx_y+radoff);
+// Background Arc
+gfx_greyscale(0.35,1);
+ArcFill(rad*2,rad*2,0.1,0.9,rad,rad*0.25);
+// Fill Arc
+gfx_set(0.5,0.5,1,1);
+ArcFill(rad*2,rad*2,sfa,efa,rad,rad*0.25);
+
+// Default Value
+gfx_set(0.5,0.5,0.5,1);
+ArcFill(rad*2,rad*2,da-0.025,da+0.025,rad,rad*0.25);
+
+// Position Arc
+gfx_set(1,1,1,1);
+ArcFill(rad*2,rad*2,va-0.025,va+0.025,rad,rad*0.25);
+IVW=min(max(3,rad*0.20),5);
+// Inner Value1
+InnerValue1>0?
+  (
+  ip1=(InnerValue1-minv)/(maxv-minv);
+  ia1=(ip1*(0.9-0.1))+0.1;
+  gfx_set(0,1,0,1);
+  ArcFill(rad*2,rad*2,0.1,ia1,rad-rad*0.25,IVW);
+  );
+// Inner Value2
+InnerValue2>0?
+  (
+  ip2=(InnerValue2-minv)/(maxv-minv);
+  ia2=(ip2*(0.9-0.1))+0.1;
+  gfx_set(1,1,0,1);
+  ArcFill(rad*2,rad*2,0.1,ia2,rad-rad*0.25-IVW,IVW);
+  );
+InnerValue1=0;
+InnerValue2=0;
+
+// Name Text
+
+gfx_setfont(1,"Arial",rad*0.45);
+gfx_measurestr(str,tw,th);
+gfx_greyscale(0.3,1);
+RoundRect2(x+(w-tw)/2-10,gfx_y+rad*2+5,tw+20,th,rad/4);
+
+gfx_x=x+(w-tw)/2;
+gfx_y+=0;
+gfx_set(0.7,0.7,0.7,1);
+gfx_drawstr(str);
+gfx_setfont(1,"Arial",rad*0.45);
+
+gfx_measurestr(InnerText,tw,th);
+gfx_x=x+(w-tw)/2;
+gfx_y=y+(h-th)/2;
+gfx_set(0.6,0.6,0.1,1);
+gfx_drawstr(InnerText);
+// trigger any param changes
+ogvalue!=value? ParamsDidChange=1;
+// return value
+value;
+);
+  // Init
+  Area(0,0,gfx_w,gfx_h);
+
+  // SDS - draw the combo heads active/inactive
+  util[0]=(1-dt1)*ActualBufSize/srate*1000;
+  util[1]=(1-dt2)*ActualBufSize/srate*1000;
+  util[2]=(1-dt3)*ActualBufSize/srate*1000;
+  util[3]=(1-dt4)*ActualBufSize/srate*1000;
+  sx=0;
+  si=0;
+  Area(0,0,gfx_w,30);
+  gfx_setfont(1,"Arial",20);
+  gfx_measurestr("Head-1  200ms",tw,th);
+  while (sx<area_w)
+  (
+  gfx_set(0.2,0.2,0.2,0.5);
+  Combos[headconfig*4+si]>0? gfx_set(1,0.5,0.2,0.85);
+  RoundRect2(area_x+sx,0,area_w/4,th,5);
+  gfx_set(0,0,0,1);
+  gfx_x=sx+(area_w/4-tw)/2;
+  gfx_y=(th-gfx_texth)/2;
+  gfx_printf("Head-%d  %dms",si,util[si]);
+  sx+=area_w/4;
+  si+=1;
+  );
+  // Draw the freq responses of
+  // the 3 main filters
+  gfx_set(0.3,0.3,1,0.33);
+  Area(0,30,gfx_w,gfx_h-30);
+  sx=0;
+  while (sx<area_w)
+    (
+    fp=InvToCurve(sx/area_w);
+
+    magLo=(BiQuadResponse(LoShelf,fp*srate/2));
+    //AreaLine(sx,area_h/2-clamp(mag,-1,1)*area_h/2,sx,area_h);
+
+    magHi=(BiQuadResponse(HiShelf,fp*srate/2));
+    AreaLine(sx,area_h/2-clamp(((magLo*magHi)-1)/3,-1,1)*area_h/2,sx,area_h);
+
+    mag=(BiQuadResponse(BandPass,fp*srate/2)-1);
+    AreaLine(sx,area_h/2-mag*area_h/2,sx,area_h); 
+    sx+=1;
+    );
+  
+    StartUI();
+  // SDS - Draw the peak and duck meters
+   Area(0,30,gfx_w,gfx_h-30);
+  // Draw the controls
+  CH=area_h/2;
+  CW=area_w/6;
+  InnerText=2;
+  // MS to BPM
+  BPM=600/rrate*100;
+  InnerText=#;
+  sprintf(InnerText,"BPM \n%2.1f ",BPM);
+  rrate=Dial(CW*0,0,CW,CH,"Time",rrate,10,1000,220,0,0);
+  innerText=-1;
+  feedback=Dial(CW*1,0,CW,CH,"Feedback",feedback,0,1,0.707,0,0);  
+  tapeage=Dial(CW*2,0,CW,CH,"Tape Age",tapeage,0.001,2,0.2,0,0);
+
+  bass=Dial(CW*4,0,CW,CH,"Bass",bass,-12,12,3,0,0);
+  high=Dial(CW*5,0,CW,CH,"Treble",high,-12,12,3,0,0);
+  sat=Dial(CW*3,0,CW,CH,"Drive",sat,0,1,0,0,0);    
+ 
+  headconfig=Dial(CW*0,CH,CW,CH,"Heads",headconfig,0,14,0,0,1);
+  warp=Dial(CW*1,CH,CW,CH,"Warp",warp,0,24,12,12,0);    
+  WAF=Dial(CW*2,CH,CW,CH,"Modulation",WAF,0,1,0,0,0);
+  InnerValue1=peak*2;
+  InnerValue2=(1-clamp(Peak*duck,0,1))*2;
+  duck=Dial(CW*3,CH,CW,CH,"Ducking",duck,0,2,0,0,0);
+
+  wet=Dial(CW*4,CH,CW,CH,"Echo Vol",wet,0,1,1,0,0);
+  dry=Dial(CW*5,CH,CW,CH,"Dry Vol",dry,0,1,1,0,0);
+
+Debug=1;
+//RoundRect2(300,300,400,200,100);
+rad=140;
+gfx_xy((gfx_w-rad*2)/2,(gfx_h-rad*2)/2);
+
+//ArcFill(rad*2,rad*2,0.1,0.9,rad,rad*0.25);
+Debug=0;
+ParamsDidChange? ParamsChanged();
+EndUI();
